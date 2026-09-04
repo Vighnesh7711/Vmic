@@ -32,7 +32,7 @@ export class VMICAudioEngine {
 
   private workletLoaded = false;
 
-  private speakingMode: "open" | "controlled" = "open";
+  private speakingMode: "open" | "controlled" = "controlled";
 
   private participants =
     new Map<
@@ -213,21 +213,9 @@ export class VMICAudioEngine {
     const p = this.participants.get(participantId);
     if (!p) return;
 
-    const floorAllowed =
-      this.speakingMode === "open"
-        ? true
-        : p.floorGranted;
-
-    const pttAllowed =
-      this.speakingMode === "open"
-        ? true
-        : p.pushToTalkActive;
-
     const effectiveGain =
       p.volume *
-      (p.muted ? 0 : 1) *
-      (floorAllowed ? 1 : 0) *
-      (pttAllowed ? 1 : 0);
+      (p.muted ? 0 : 1);
 
     p.gain.gain.value = effectiveGain;
 
@@ -298,7 +286,7 @@ export class VMICAudioEngine {
       worklet,
       volume: 1.0,
       muted: false,
-      floorGranted: true,
+      floorGranted: false,
       pushToTalkActive: true,
     };
 

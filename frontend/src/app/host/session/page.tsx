@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 
 import { getSocket } from "@/services/socket";
@@ -13,7 +13,7 @@ import { WiFiWebRTCTransport } from "@/services/transports/wifi-webrtc-transport
 import { BluetoothTransport, BluetoothAudioDevice } from "@/services/transports/bluetooth-transport";
 import { ParticipantCard } from "@/components/participant/participant-card";
 import { SOCKET_EVENTS } from "@/lib/socket-events";
-import { getFrontendUrl } from "@/lib/config";
+import { getBackendUrl, getFrontendUrl } from "@/lib/config";
 
 export default function HostSessionPage() {
 
@@ -36,8 +36,11 @@ export default function HostSessionPage() {
   const [selectedOutputDevice, setSelectedOutputDevice] = useState<string>("");
 
   const [currentSpeaker, setCurrentSpeaker] = useState<string | null>(null);
+  const currentSpeakerRef = useRef<string | null>(null);
+  const joinedRoomRef = useRef<string | null>(null);
+  const handledOffersRef = useRef(new Set<string>());
   const [speakerQueue, setSpeakerQueue] = useState<string[]>([]);
-  const [speakingMode, setSpeakingMode] = useState<SpeakingMode>("open");
+  const speakingMode: SpeakingMode = "controlled";
   const [roomCode, setRoomCode] = useState<string>("");
   const [joinUrl, setJoinUrl] = useState<string>("");
 
@@ -91,6 +94,12 @@ export default function HostSessionPage() {
           (participantId, stream) => {
             audioEngine
               .addParticipantStream(participantId, stream)
+              .then(() => {
+                audioEngine.setParticipantFloor(
+                  participantId,
+                  currentSpeakerRef.current === participantId
+                );
+              })
               .catch((error) => {
                 console.error("[Audio] Failed to add stream:", error);
               });
@@ -150,16 +159,51 @@ export default function HostSessionPage() {
     setJoinUrl(`${getFrontendUrl()}/join?room=${code}`);
 
     if (code) {
-      socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
-        room_code: code,
-        role: "host",
-      });
+      fetch(`${getBackendUrl()}/api/sessions/${code}`)
+        .then((response) => response.json())
+        .then((session) => {
+          const speaker = session.current_speaker ?? null;
+          currentSpeakerRef.current = speaker;
+          setCurrentSpeaker(speaker);
+          setSpeakerQueue(session.speaker_queue ?? []);
+          if (speaker) {
+            audioEngine.setParticipantFloor(speaker, true);
+          }
+        })
+        .catch((error) => console.error("[Host] Failed to load floor state:", error));
+
+      fetch(`${getBackendUrl()}/api/sessions/${code}/participants`)
+        .then((response) => response.json())
+        .then((existingParticipants) => {
+          if (!Array.isArray(existingParticipants)) return;
+
+          setParticipants(existingParticipants.map((participant) => {
+            const transport = (participant.transport?.toLowerCase() || "wifi") as AudioTransportType;
+            return {
+            participantId: participant.participant_id,
+            displayName: participant.display_name,
+            connectionType: transport,
+            transport,
+            connectionState: participant.connection_state || "connecting",
+            volume: Math.round((participant.volume ?? 1) * 100),
+            muted: participant.muted ?? false,
+            audioLevel: 0,
+            speaking: false,
+            floorState: "none",
+            pushToTalkActive: true,
+            };
+          }));
+        })
+        .catch((error) => console.error("[Host] Failed to load participants:", error));
     }
 
     // Auto-discover connected Bluetooth Speakers / Output Sinks
     handleScanOutputDevices();
 
     const handleOffer = async (data: { participant_id: string; sdp: string }) => {
+      if (handledOffersRef.current.has(data.participant_id)) return;
+      handledOffersRef.current.add(data.participant_id);
+
       try {
         const answer = await hostWebRTC.handleOffer(data.participant_id, data.sdp);
         socket.emit(SOCKET_EVENTS.WEBRTC_ANSWER, {
@@ -171,6 +215,7 @@ export default function HostSessionPage() {
         wifiTransport.connect(data.participant_id);
         setStatus(`Answer sent to ${data.participant_id}`);
       } catch (error) {
+        handledOffersRef.current.delete(data.participant_id);
         console.error("[Host WebRTC] Error:", error);
         setStatus("WebRTC negotiation failed");
       }
@@ -182,6 +227,14 @@ export default function HostSessionPage() {
 
     socket.on(SOCKET_EVENTS.WEBRTC_OFFER, handleOffer);
     socket.on(SOCKET_EVENTS.ICE_CANDIDATE, handleIceCandidate);
+
+    if (code && joinedRoomRef.current !== code) {
+      joinedRoomRef.current = code;
+      socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
+        room_code: code,
+        role: "host",
+      });
+    }
 
     return () => {
       socket.off(SOCKET_EVENTS.WEBRTC_OFFER, handleOffer);
@@ -223,7 +276,7 @@ export default function HostSessionPage() {
             audioLevel: 0,
             speaking: false,
             floorState: "none",
-            pushToTalkActive: false,
+            pushToTalkActive: true,
           },
         ];
       });
@@ -277,6 +330,7 @@ export default function HostSessionPage() {
       queue: string[];
     }) => {
       setCurrentSpeaker(data.current_speaker);
+      currentSpeakerRef.current = data.current_speaker;
       setSpeakerQueue(data.queue);
 
       setParticipants((current) =>
@@ -325,6 +379,36 @@ export default function HostSessionPage() {
     };
   }, [socket, audioEngine]);
 
+  useEffect(() => {
+    const handleAudioControl = (data: { participant_id: string; muted: boolean }) => {
+      if (data.muted) {
+        audioEngine.muteParticipant(data.participant_id);
+      } else {
+        const participant = participants.find(
+          (item) => item.participantId === data.participant_id
+        );
+        audioEngine.unmuteParticipant(
+          data.participant_id,
+          participant ? participant.volume / 100 : 1
+        );
+      }
+
+      setParticipants((current) =>
+        current.map((participant) =>
+          participant.participantId === data.participant_id
+            ? { ...participant, muted: data.muted }
+            : participant
+        )
+      );
+    };
+
+    socket.on(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
+
+    return () => {
+      socket.off(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
+    };
+  }, [socket, audioEngine, participants]);
+
   const handleScanBluetoothDevices = async () => {
     try {
       const devices = await bluetoothTransport.enumerateBluetoothDevices();
@@ -366,6 +450,11 @@ export default function HostSessionPage() {
   };
 
   const handleMute = (participantId: string) => {
+    const participant = participants.find((p) => p.participantId === participantId);
+    if (!participant) {
+      return;
+    }
+
     setParticipants((current) =>
       current.map((p) => {
         if (p.participantId === participantId) {
@@ -406,12 +495,6 @@ export default function HostSessionPage() {
 
   const handleReleaseFloor = (participantId: string) => {
     socket.emit(SOCKET_EVENTS.RELEASE_FLOOR, { participant_id: participantId });
-  };
-
-  const toggleSpeakingMode = () => {
-    const nextMode = speakingMode === "controlled" ? "open" : "controlled";
-    setSpeakingMode(nextMode);
-    audioEngine.setSpeakingMode(nextMode);
   };
 
   const handleScanOutputDevices = async () => {
@@ -462,19 +545,9 @@ export default function HostSessionPage() {
           {status}
         </p>
 
-        <div className="mt-4 flex items-center justify-center gap-4">
-          <span className="text-sm text-gray-400">Speaking Mode:</span>
-          <button
-            onClick={toggleSpeakingMode}
-            className={`rounded-lg px-3 py-1.5 text-xs font-bold uppercase transition ${
-              speakingMode === "open"
-                ? "bg-green-500 text-black"
-                : "bg-blue-500 text-white"
-            }`}
-          >
-            {speakingMode} Floor Mode
-          </button>
-        </div>
+        <p className="mt-4 text-sm text-blue-400">
+          Single-speaker mode: only the participant with the floor can speak.
+        </p>
 
         <p className="mt-2 text-sm text-gray-500">
           Connected Participants: {participants.length}

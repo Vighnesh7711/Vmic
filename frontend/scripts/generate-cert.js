@@ -17,6 +17,7 @@ async function generateCerts() {
       { type: 7, ip: "127.0.0.1" },
       { type: 7, ip: "192.168.137.1" },
       { type: 7, ip: "10.110.120.201" },
+      { type: 7, ip: "10.104.12.231" },
       { type: 7, ip: "0.0.0.0" },
     ],
   };

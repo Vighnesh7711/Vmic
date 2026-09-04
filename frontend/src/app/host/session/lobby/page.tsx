@@ -120,7 +120,9 @@ export default function LobbyPage() {
     setSelectedLanIp(newIp);
     setCurrentIp(newIp);
     const roomCode = session?.room_code || "";
-    setJoinUrl(`https://${newIp}:3000/join?room=${roomCode}`);
+    const protocol = window.location.protocol;
+    const port = window.location.port || "3000";
+    setJoinUrl(`${protocol}//${newIp}:${port}/join?room=${roomCode}`);
   };
 
   const handleStartSession = async () => {

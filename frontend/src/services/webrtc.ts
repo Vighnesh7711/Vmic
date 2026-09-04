@@ -28,15 +28,24 @@ export class VMICWebRTC {
       );
     }
 
-    this.localStream =
-      await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+    try {
+      this.localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
         video: false,
       });
+    } catch (error) {
+      const name = error instanceof DOMException ? error.name : "";
+
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        throw new Error("Microphone permission was denied. Allow microphone access for this site in Chrome settings, then reload.");
+      }
+
+      if (name === "NotReadableError" || name === "AbortError") {
+        throw new Error("The microphone is busy or unavailable. Close other apps or browser tabs using the microphone, then reload.");
+      }
+
+      throw new Error("Could not start the microphone. Check the phone microphone permission and try again.");
+    }
 
     return this.localStream;
   }
@@ -123,6 +132,12 @@ export class VMICWebRTC {
     );
 
     return offer;
+  }
+
+  setMicrophoneMuted(muted: boolean) {
+    this.localStream?.getAudioTracks().forEach((track) => {
+      track.enabled = !muted;
+    });
   }
 
   async setRemoteAnswer(

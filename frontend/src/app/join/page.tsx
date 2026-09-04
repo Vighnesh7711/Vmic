@@ -33,12 +33,7 @@ function JoinForm() {
   const [participantId, setParticipantId] =
     useState<string | null>(null);
 
-  const [floorStatus, setFloorStatus] = useState<
-    "none" | "requested" | "granted"
-  >("none");
-
-  const [pushToTalkActive, setPushToTalkActive] =
-    useState(false);
+  const [isMuted, setIsMuted] = useState(true);
 
   const [currentSpeaker, setCurrentSpeaker] = useState<string | null>(null);
 
@@ -73,17 +68,6 @@ function JoinForm() {
   }, [roomParam, roomCode]);
 
   useEffect(() => {
-    if (
-      typeof window !== "undefined" &&
-      window.location.protocol === "http:" &&
-      window.location.hostname !== "localhost" &&
-      window.location.hostname !== "127.0.0.1"
-    ) {
-      window.location.href = window.location.href.replace("http:", "https:");
-    }
-  }, []);
-
-  useEffect(() => {
     const handleConnect = () => {
       setConnectionStatus("Control channel connected");
     };
@@ -94,6 +78,10 @@ function JoinForm() {
 
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
+
+    if (socket.connected) {
+      handleConnect();
+    }
 
     return () => {
       socket.off("connect", handleConnect);
@@ -116,15 +104,6 @@ function JoinForm() {
 
     const handleFloorUpdated = (data: { current_speaker: string | null; queue: string[] }) => {
       setCurrentSpeaker(data.current_speaker);
-
-      if (data.current_speaker === participantId) {
-        setFloorStatus("granted");
-      } else if (participantId && data.queue.includes(participantId)) {
-        setFloorStatus("requested");
-      } else {
-        setFloorStatus("none");
-        setPushToTalkActive(false);
-      }
     };
 
     socket.on(SOCKET_EVENTS.WEBRTC_ANSWER, handleAnswer);
@@ -135,6 +114,22 @@ function JoinForm() {
       socket.off(SOCKET_EVENTS.WEBRTC_ANSWER, handleAnswer);
       socket.off(SOCKET_EVENTS.ICE_CANDIDATE, handleIceCandidate);
       socket.off(SOCKET_EVENTS.FLOOR_UPDATED, handleFloorUpdated);
+    };
+  }, [socket, webrtc, participantId]);
+
+  useEffect(() => {
+    const handleAudioControl = (data: { participant_id: string; muted: boolean }) => {
+      if (data.participant_id !== participantId) return;
+
+      webrtc.setMicrophoneMuted(data.muted);
+      setIsMuted(data.muted);
+      setConnectionStatus(data.muted ? "Voice transmission muted" : "Voice transmission active");
+    };
+
+    socket.on(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
+
+    return () => {
+      socket.off(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
     };
   }, [socket, webrtc, participantId]);
 
@@ -186,7 +181,7 @@ function JoinForm() {
       const data = await response.json();
 
       if (!response.ok) {
-        setStatus("Session Not Found");
+        setStatus(response.status === 404 ? "Session Not Found" : "Join Failed");
         if (response.status === 404) {
           alert(`Session "${roomCode}" was not found or has ended. Please scan the current active QR code on the host display.`);
         } else {
@@ -196,17 +191,43 @@ function JoinForm() {
       }
 
       setParticipantId(data.participant_id);
+      setIsMuted(data.muted ?? true);
       setStatus("Joined");
 
       localStorage.setItem("vmic-participant", JSON.stringify(data));
       localStorage.setItem("vmic-room", roomCode.toUpperCase());
 
-      socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
+      const joinSocketRoom = () => socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
         room_code: roomCode.toUpperCase(),
         role: "participant",
         participant_id: data.participant_id,
         transport: selection.transport,
       });
+
+      if (socket.connected) {
+        joinSocketRoom();
+      } else {
+        await new Promise<void>((resolve) => {
+          socket.once("connect", () => {
+            joinSocketRoom();
+            resolve();
+          });
+        });
+      }
+
+      if (selection.transport === "wifi") {
+        try {
+          await webrtc.initializeMicrophone();
+          await sendWebRTCOffer(data.participant_id, roomCode.toUpperCase());
+        } catch (error) {
+          console.error("[WebRTC] Microphone startup failed:", error);
+          const message = error instanceof Error
+            ? error.message
+            : "Microphone permission is required for voice.";
+          setConnectionStatus(message);
+          alert(`Joined the session, but microphone access failed: ${message}`);
+        }
+      }
 
     } catch (error) {
       console.error(error);
@@ -214,57 +235,35 @@ function JoinForm() {
     }
   };
 
-  const startWebRTC = async () => {
-    if (!participantId) return;
+  const sendWebRTCOffer = async (participantIdToStart: string, roomCodeToStart: string) => {
+    setConnectionStatus("Starting WebRTC...");
+    await webrtc.createPeerConnection();
+    const offer = await webrtc.createOffer();
 
-    try {
-      setConnectionStatus("Starting WebRTC...");
-      await webrtc.initializeMicrophone();
-      await webrtc.createPeerConnection();
-      const offer = await webrtc.createOffer();
+    socket.emit(SOCKET_EVENTS.WEBRTC_OFFER, {
+      room_code: roomCodeToStart,
+      participant_id: participantIdToStart,
+      sdp: offer.sdp,
+    });
 
-      socket.emit(SOCKET_EVENTS.WEBRTC_OFFER, {
-        room_code: roomCode.toUpperCase(),
-        participant_id: participantId,
-        sdp: offer.sdp,
-      });
-
-      setConnectionStatus("Offer sent — waiting for host");
-    } catch (error) {
-      console.error("[WebRTC] Failed:", error);
-      setConnectionStatus("WebRTC failed");
-    }
-  };
-
-  const handleRequestFloor = () => {
-    if (!participantId) return;
-
-    if (floorStatus === "none") {
-      socket.emit(SOCKET_EVENTS.REQUEST_FLOOR);
-      setFloorStatus("requested");
-    } else if (floorStatus === "granted" || floorStatus === "requested") {
-      socket.emit(SOCKET_EVENTS.RELEASE_FLOOR);
-      setFloorStatus("none");
-      setPushToTalkActive(false);
-    }
-  };
-
-  const handlePTTStart = () => {
-    if (floorStatus !== "granted") return;
-    setPushToTalkActive(true);
-    socket.emit(SOCKET_EVENTS.PUSH_TO_TALK, { active: true });
-  };
-
-  const handlePTTEnd = () => {
-    if (!pushToTalkActive) return;
-    setPushToTalkActive(false);
-    socket.emit(SOCKET_EVENTS.PUSH_TO_TALK, { active: false });
+    setConnectionStatus("Offer sent - waiting for host");
   };
 
   const handleSendLatencyPing = () => {
     if (!participantId) return;
     const timestamp = Date.now();
     socket.emit(SOCKET_EVENTS.LATENCY_PING, { timestamp });
+  };
+
+  const handleToggleMute = () => {
+    if (!participantId) return;
+
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    socket.emit(
+      nextMuted ? SOCKET_EVENTS.MUTE_PARTICIPANT : SOCKET_EVENTS.UNMUTE_PARTICIPANT,
+      { participant_id: participantId },
+    );
   };
 
   return (
@@ -334,54 +333,16 @@ function JoinForm() {
           JOIN SESSION
         </button>
 
-        {selectedTransport?.transport === "wifi" && (
-          <button
-            onClick={startWebRTC}
-            disabled={!participantId}
-            className="w-full rounded-lg bg-blue-500 px-4 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            START WEBRTC AUDIO
-          </button>
-        )}
-
         {participantId && (
           <button
-            onClick={handleRequestFloor}
+            onClick={handleToggleMute}
             className={`w-full rounded-lg px-4 py-3 font-semibold transition ${
-              floorStatus === "granted"
-                ? "bg-blue-500 text-white hover:bg-blue-400"
-                : floorStatus === "requested"
-                ? "bg-yellow-500 text-black hover:bg-yellow-400"
-                : "border border-gray-700 bg-gray-800 text-white hover:border-gray-600"
+              isMuted
+                ? "border border-red-500 bg-red-500/10 text-red-400"
+                : "bg-green-500 text-black hover:bg-green-400"
             }`}
           >
-            {floorStatus === "granted"
-              ? "RELEASE FLOOR"
-              : floorStatus === "requested"
-              ? "REQUESTED — WAITING IN QUEUE"
-              : "REQUEST TO SPEAK"}
-          </button>
-        )}
-
-        {participantId && (
-          <button
-            disabled={floorStatus !== "granted"}
-            onPointerDown={handlePTTStart}
-            onPointerUp={handlePTTEnd}
-            onPointerLeave={handlePTTEnd}
-            className={`w-full rounded-xl py-6 text-lg font-bold transition select-none ${
-              floorStatus !== "granted"
-                ? "bg-gray-800 text-gray-500 cursor-not-allowed opacity-50"
-                : pushToTalkActive
-                ? "bg-red-500 text-white scale-98 shadow-lg shadow-red-500/30"
-                : "bg-green-500 text-black hover:bg-green-400 shadow-lg shadow-green-500/20"
-            }`}
-          >
-            {floorStatus !== "granted"
-              ? "WAITING FOR FLOOR"
-              : pushToTalkActive
-              ? "🎤 SPEAKING..."
-              : "🎤 HOLD TO TALK"}
+            {isMuted ? "UNMUTE MICROPHONE" : "MUTE MICROPHONE"}
           </button>
         )}
 

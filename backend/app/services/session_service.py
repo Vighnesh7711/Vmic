@@ -131,11 +131,18 @@ def add_participant(
     if len(session["participants"]) >= session["max_participants"]:
         return None, "SESSION_FULL"
 
+    normalized_name = display_name.strip().casefold()
+    if any(
+        participant["display_name"].strip().casefold() == normalized_name
+        for participant in session["participants"]
+    ):
+        return None, "DUPLICATE_DISPLAY_NAME"
+
     participant_id = str(uuid.uuid4())
 
     participant = {
         "participant_id": participant_id,
-        "display_name": display_name,
+        "display_name": display_name.strip(),
         "room_code": session["room_code"],
         "connection_state": "JOINING",
         "transport": transport.upper(),

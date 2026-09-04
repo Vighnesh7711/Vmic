@@ -46,6 +46,8 @@ def _session_response(session: dict) -> dict:
         "created_at": session["created_at"],
         "ended_at": session.get("ended_at"),
         "participant_count": len(session.get("participants", [])),
+        "current_speaker": session.get("floor", {}).get("current_speaker"),
+        "speaker_queue": session.get("floor", {}).get("queue", []),
     }
 
 
@@ -179,6 +181,12 @@ async def join_session(
         raise HTTPException(
             status_code=409,
             detail="Session is full"
+        )
+
+    if error == "DUPLICATE_DISPLAY_NAME":
+        raise HTTPException(
+            status_code=409,
+            detail="That participant name is already in use. Please choose a different name."
         )
 
     await broadcast_participant_joined(

@@ -8,14 +8,13 @@
  */
 
 export const KNOWN_LAN_IPS = [
-  "10.110.120.201",  // Wi-Fi Router
-  "192.168.137.1",   // Mobile Hotspot
+  "10.104.12.231",  // Wi-Fi
 ];
 
 export function getSelectedLanIp(): string {
   if (typeof window !== "undefined") {
     const saved = localStorage.getItem("vmic-selected-ip");
-    if (saved) return saved;
+    if (saved && KNOWN_LAN_IPS.includes(saved)) return saved;
 
     const hostname = window.location.hostname;
     if (hostname !== "localhost" && hostname !== "127.0.0.1") {
@@ -44,25 +43,23 @@ export function setSelectedLanIp(ip: string): void {
 export function getBackendUrl(): string {
   if (typeof window !== "undefined") {
     const hostname = window.location.hostname;
-    return `http://${hostname}:8000`;
+    const protocol = window.location.protocol;
+    return `${protocol}//${hostname}:8000`;
   }
-  return `http://${getSelectedLanIp()}:8000`;
+  return `https://${getSelectedLanIp()}:8000`;
 }
 
-/**
- * Frontend URL for QR codes.
- * Uses HTTPS since the Next.js dev server now runs with --experimental-https.
- */
 export function getFrontendUrl(): string {
   if (typeof window !== "undefined") {
     const hostname = window.location.hostname;
     const port = window.location.port || "3000";
+    const protocol = window.location.protocol;
 
     if (hostname === "localhost" || hostname === "127.0.0.1") {
-      return `https://${getSelectedLanIp()}:${port}`;
+      return `${protocol}//${getSelectedLanIp()}:${port}`;
     }
 
-    return `https://${hostname}:${port}`;
+    return `${protocol}//${hostname}:${port}`;
   }
   return `https://${getSelectedLanIp()}:3000`;
 }
