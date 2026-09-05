@@ -3,10 +3,11 @@
 import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { VMICWebRTC } from "@/services/webrtc";
+import { VMICWebRTC, AudioProcessingConfig } from "@/services/webrtc";
 import { getSocket } from "@/services/socket";
 import { SOCKET_EVENTS } from "@/lib/socket-events";
 import { getBackendUrl } from "@/lib/config";
+import { WaveformVisualizer } from "@/components/audio/waveform-visualizer";
 import {
   VMICTransportSelector,
   TransportPreference,
@@ -33,14 +34,22 @@ function JoinForm() {
   const [participantId, setParticipantId] =
     useState<string | null>(null);
 
-  const [floorStatus, setFloorStatus] = useState<
-    "none" | "requested" | "granted"
-  >("none");
-
-  const [pushToTalkActive, setPushToTalkActive] =
-    useState(false);
+  const [isMuted, setIsMuted] = useState(true);
 
   const [currentSpeaker, setCurrentSpeaker] = useState<string | null>(null);
+
+  // Audio processing toggles
+  const [audioProcessing, setAudioProcessing] = useState<AudioProcessingConfig>({
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    gateThreshold: 0.06,
+    gateHoldMs: 250,
+  });
+
+  // Live mic level from noise gate
+  const [micLevel, setMicLevel] = useState(0);
+  const [gateIsOpen, setGateIsOpen] = useState(false);
 
   const [socket] = useState(
     () => getSocket()
@@ -62,26 +71,27 @@ function JoinForm() {
             participant_id: participant.participant_id,
             candidate: candidate.toJSON(),
           });
+        },
+        undefined,
+        // Mic level callback for live UI meter
+        (level: number, open: boolean) => {
+          setMicLevel(level);
+          setGateIsOpen(open);
         }
       )
   );
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.location.protocol === "http:") {
+      window.location.href = window.location.href.replace("http:", "https:");
+    }
+  }, []);
 
   useEffect(() => {
     if (roomParam && !roomCode) {
       setRoomCode(roomParam.toUpperCase());
     }
   }, [roomParam, roomCode]);
-
-  useEffect(() => {
-    if (
-      typeof window !== "undefined" &&
-      window.location.protocol === "http:" &&
-      window.location.hostname !== "localhost" &&
-      window.location.hostname !== "127.0.0.1"
-    ) {
-      window.location.href = window.location.href.replace("http:", "https:");
-    }
-  }, []);
 
   useEffect(() => {
     const handleConnect = () => {
@@ -94,6 +104,10 @@ function JoinForm() {
 
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
+
+    if (socket.connected) {
+      handleConnect();
+    }
 
     return () => {
       socket.off("connect", handleConnect);
@@ -116,15 +130,6 @@ function JoinForm() {
 
     const handleFloorUpdated = (data: { current_speaker: string | null; queue: string[] }) => {
       setCurrentSpeaker(data.current_speaker);
-
-      if (data.current_speaker === participantId) {
-        setFloorStatus("granted");
-      } else if (participantId && data.queue.includes(participantId)) {
-        setFloorStatus("requested");
-      } else {
-        setFloorStatus("none");
-        setPushToTalkActive(false);
-      }
     };
 
     socket.on(SOCKET_EVENTS.WEBRTC_ANSWER, handleAnswer);
@@ -135,6 +140,22 @@ function JoinForm() {
       socket.off(SOCKET_EVENTS.WEBRTC_ANSWER, handleAnswer);
       socket.off(SOCKET_EVENTS.ICE_CANDIDATE, handleIceCandidate);
       socket.off(SOCKET_EVENTS.FLOOR_UPDATED, handleFloorUpdated);
+    };
+  }, [socket, webrtc, participantId]);
+
+  useEffect(() => {
+    const handleAudioControl = (data: { participant_id: string; muted: boolean }) => {
+      if (data.participant_id !== participantId) return;
+
+      webrtc.setMicrophoneMuted(data.muted);
+      setIsMuted(data.muted);
+      setConnectionStatus(data.muted ? "Voice transmission muted" : "Voice transmission active");
+    };
+
+    socket.on(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
+
+    return () => {
+      socket.off(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
     };
   }, [socket, webrtc, participantId]);
 
@@ -186,7 +207,7 @@ function JoinForm() {
       const data = await response.json();
 
       if (!response.ok) {
-        setStatus("Session Not Found");
+        setStatus(response.status === 404 ? "Session Not Found" : "Join Failed");
         if (response.status === 404) {
           alert(`Session "${roomCode}" was not found or has ended. Please scan the current active QR code on the host display.`);
         } else {
@@ -196,17 +217,43 @@ function JoinForm() {
       }
 
       setParticipantId(data.participant_id);
+      setIsMuted(data.muted ?? true);
       setStatus("Joined");
 
       localStorage.setItem("vmic-participant", JSON.stringify(data));
       localStorage.setItem("vmic-room", roomCode.toUpperCase());
 
-      socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
+      const joinSocketRoom = () => socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
         room_code: roomCode.toUpperCase(),
         role: "participant",
         participant_id: data.participant_id,
         transport: selection.transport,
       });
+
+      if (socket.connected) {
+        joinSocketRoom();
+      } else {
+        await new Promise<void>((resolve) => {
+          socket.once("connect", () => {
+            joinSocketRoom();
+            resolve();
+          });
+        });
+      }
+
+      if (selection.transport === "wifi") {
+        try {
+          await webrtc.initializeMicrophone();
+          await sendWebRTCOffer(data.participant_id, roomCode.toUpperCase());
+        } catch (error) {
+          console.error("[WebRTC] Microphone startup failed:", error);
+          const message = error instanceof Error
+            ? error.message
+            : "Microphone permission is required for voice.";
+          setConnectionStatus(message);
+          alert(`Joined the session, but microphone access failed: ${message}`);
+        }
+      }
 
     } catch (error) {
       console.error(error);
@@ -214,57 +261,35 @@ function JoinForm() {
     }
   };
 
-  const startWebRTC = async () => {
-    if (!participantId) return;
+  const sendWebRTCOffer = async (participantIdToStart: string, roomCodeToStart: string) => {
+    setConnectionStatus("Starting WebRTC...");
+    await webrtc.createPeerConnection();
+    const offer = await webrtc.createOffer();
 
-    try {
-      setConnectionStatus("Starting WebRTC...");
-      await webrtc.initializeMicrophone();
-      await webrtc.createPeerConnection();
-      const offer = await webrtc.createOffer();
+    socket.emit(SOCKET_EVENTS.WEBRTC_OFFER, {
+      room_code: roomCodeToStart,
+      participant_id: participantIdToStart,
+      sdp: offer.sdp,
+    });
 
-      socket.emit(SOCKET_EVENTS.WEBRTC_OFFER, {
-        room_code: roomCode.toUpperCase(),
-        participant_id: participantId,
-        sdp: offer.sdp,
-      });
-
-      setConnectionStatus("Offer sent — waiting for host");
-    } catch (error) {
-      console.error("[WebRTC] Failed:", error);
-      setConnectionStatus("WebRTC failed");
-    }
-  };
-
-  const handleRequestFloor = () => {
-    if (!participantId) return;
-
-    if (floorStatus === "none") {
-      socket.emit(SOCKET_EVENTS.REQUEST_FLOOR);
-      setFloorStatus("requested");
-    } else if (floorStatus === "granted" || floorStatus === "requested") {
-      socket.emit(SOCKET_EVENTS.RELEASE_FLOOR);
-      setFloorStatus("none");
-      setPushToTalkActive(false);
-    }
-  };
-
-  const handlePTTStart = () => {
-    if (floorStatus !== "granted") return;
-    setPushToTalkActive(true);
-    socket.emit(SOCKET_EVENTS.PUSH_TO_TALK, { active: true });
-  };
-
-  const handlePTTEnd = () => {
-    if (!pushToTalkActive) return;
-    setPushToTalkActive(false);
-    socket.emit(SOCKET_EVENTS.PUSH_TO_TALK, { active: false });
+    setConnectionStatus("Offer sent - waiting for host");
   };
 
   const handleSendLatencyPing = () => {
     if (!participantId) return;
     const timestamp = Date.now();
     socket.emit(SOCKET_EVENTS.LATENCY_PING, { timestamp });
+  };
+
+  const handleToggleMute = () => {
+    if (!participantId) return;
+
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    socket.emit(
+      nextMuted ? SOCKET_EVENTS.MUTE_PARTICIPANT : SOCKET_EVENTS.UNMUTE_PARTICIPANT,
+      { participant_id: participantId },
+    );
   };
 
   return (
@@ -334,54 +359,16 @@ function JoinForm() {
           JOIN SESSION
         </button>
 
-        {selectedTransport?.transport === "wifi" && (
-          <button
-            onClick={startWebRTC}
-            disabled={!participantId}
-            className="w-full rounded-lg bg-blue-500 px-4 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            START WEBRTC AUDIO
-          </button>
-        )}
-
         {participantId && (
           <button
-            onClick={handleRequestFloor}
+            onClick={handleToggleMute}
             className={`w-full rounded-lg px-4 py-3 font-semibold transition ${
-              floorStatus === "granted"
-                ? "bg-blue-500 text-white hover:bg-blue-400"
-                : floorStatus === "requested"
-                ? "bg-yellow-500 text-black hover:bg-yellow-400"
-                : "border border-gray-700 bg-gray-800 text-white hover:border-gray-600"
+              isMuted
+                ? "border border-red-500 bg-red-500/10 text-red-400"
+                : "bg-green-500 text-black hover:bg-green-400"
             }`}
           >
-            {floorStatus === "granted"
-              ? "RELEASE FLOOR"
-              : floorStatus === "requested"
-              ? "REQUESTED — WAITING IN QUEUE"
-              : "REQUEST TO SPEAK"}
-          </button>
-        )}
-
-        {participantId && (
-          <button
-            disabled={floorStatus !== "granted"}
-            onPointerDown={handlePTTStart}
-            onPointerUp={handlePTTEnd}
-            onPointerLeave={handlePTTEnd}
-            className={`w-full rounded-xl py-6 text-lg font-bold transition select-none ${
-              floorStatus !== "granted"
-                ? "bg-gray-800 text-gray-500 cursor-not-allowed opacity-50"
-                : pushToTalkActive
-                ? "bg-red-500 text-white scale-98 shadow-lg shadow-red-500/30"
-                : "bg-green-500 text-black hover:bg-green-400 shadow-lg shadow-green-500/20"
-            }`}
-          >
-            {floorStatus !== "granted"
-              ? "WAITING FOR FLOOR"
-              : pushToTalkActive
-              ? "🎤 SPEAKING..."
-              : "🎤 HOLD TO TALK"}
+            {isMuted ? "UNMUTE MICROPHONE" : "MUTE MICROPHONE"}
           </button>
         )}
 
@@ -392,6 +379,105 @@ function JoinForm() {
           >
             ⏱️ TEST E2E LATENCY PING
           </button>
+        )}
+
+        {/* Audio Processing Controls */}
+        {participantId && (
+          <div className="rounded-xl border border-gray-800 bg-gray-950 p-4 space-y-4">
+            <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider">🎛️ Audio Processing</p>
+
+            {/* Live Waveform & Echo Detector Canvas */}
+            <WaveformVisualizer analyser={webrtc.getAnalyserNode?.() ?? null} height={100} />
+
+            {/* Live Mic Level Meter + Gate Status */}
+            <div className="rounded-lg bg-gray-900 border border-gray-800 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] text-gray-500 font-semibold">MIC LEVEL</span>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                  gateIsOpen
+                    ? "bg-green-500/20 text-green-400 border border-green-500/40"
+                    : "bg-red-500/20 text-red-400 border border-red-500/40"
+                }`}>
+                  GATE {gateIsOpen ? "OPEN" : "CLOSED"}
+                </span>
+              </div>
+              <div className="w-full h-3 bg-gray-800 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-75 ${
+                    gateIsOpen ? "bg-green-500" : "bg-red-500/60"
+                  }`}
+                  style={{ width: `${Math.min(100, micLevel * 500)}%` }}
+                />
+              </div>
+              <div className="flex justify-between mt-1">
+                <span className="text-[9px] text-gray-600">0</span>
+                <span className="text-[9px] text-gray-600 font-mono">
+                  {(micLevel * 100).toFixed(1)}%
+                </span>
+                <span className="text-[9px] text-gray-600">100</span>
+              </div>
+            </div>
+
+            {/* Gate Threshold Slider */}
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-[11px] text-gray-400 font-semibold">🚪 Gate Sensitivity</label>
+                <span className="text-[10px] text-green-400 font-mono font-bold">
+                  {(audioProcessing.gateThreshold * 100).toFixed(0)}%
+                </span>
+              </div>
+              <input
+                type="range"
+                min="1"
+                max="20"
+                value={audioProcessing.gateThreshold * 100}
+                onChange={(e) => {
+                  const val = Number(e.target.value) / 100;
+                  const updated = { ...audioProcessing, gateThreshold: val };
+                  setAudioProcessing(updated);
+                  webrtc.setAudioProcessing({ gateThreshold: val });
+                }}
+                className="w-full accent-green-500"
+              />
+              <div className="flex justify-between">
+                <span className="text-[9px] text-gray-600">Sensitive</span>
+                <span className="text-[9px] text-gray-600">Aggressive</span>
+              </div>
+              <p className="text-[9px] text-gray-600 mt-1">
+                Higher = only loud/close speech passes. Prevents feedback loops.
+              </p>
+            </div>
+
+            {/* Toggle Buttons */}
+            <div className="space-y-2">
+              {[
+                { key: "echoCancellation" as const, label: "Echo Cancellation", icon: "🔇" },
+                { key: "noiseSuppression" as const, label: "Noise Suppression", icon: "🔈" },
+                { key: "autoGainControl" as const, label: "Auto Gain Control", icon: "📊" },
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  onClick={() => {
+                    const updated = { ...audioProcessing, [opt.key]: !audioProcessing[opt.key] };
+                    setAudioProcessing(updated);
+                    webrtc.setAudioProcessing(updated);
+                  }}
+                  className={`w-full flex items-center justify-between rounded-lg px-3 py-2.5 text-xs font-semibold transition border ${
+                    audioProcessing[opt.key]
+                      ? "bg-green-500/15 text-green-400 border-green-500/40"
+                      : "bg-gray-900 text-gray-500 border-gray-800"
+                  }`}
+                >
+                  <span>{opt.icon} {opt.label}</span>
+                  <span className={`text-[10px] font-bold uppercase ${
+                    audioProcessing[opt.key] ? "text-green-400" : "text-gray-600"
+                  }`}>
+                    {audioProcessing[opt.key] ? "ON" : "OFF"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
         )}
       </div>
 

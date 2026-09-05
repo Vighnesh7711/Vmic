@@ -120,7 +120,8 @@ export default function LobbyPage() {
     setSelectedLanIp(newIp);
     setCurrentIp(newIp);
     const roomCode = session?.room_code || "";
-    setJoinUrl(`https://${newIp}:3000/join?room=${roomCode}`);
+    const port = window.location.port || "3000";
+    setJoinUrl(`https://${newIp}:${port}/join?room=${roomCode}`);
   };
 
   const handleStartSession = async () => {
@@ -167,20 +168,34 @@ export default function LobbyPage() {
             <span className="text-gray-400 font-semibold">🌐 Host Network Interface IP:</span>
             <span className="font-mono text-green-400 font-bold">{currentIp}</span>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             {KNOWN_LAN_IPS.map((ip) => (
               <button
                 key={ip}
                 onClick={() => handleIpChange(ip)}
-                className={`flex-1 rounded-lg py-1.5 font-mono text-xs transition border ${
+                className={`flex-1 min-w-[120px] rounded-lg py-1.5 font-mono text-xs transition border ${
                   currentIp === ip
                     ? "bg-green-500/20 text-green-400 border-green-500/50 font-bold"
                     : "bg-gray-900 text-gray-400 border-gray-800 hover:border-gray-700"
                 }`}
               >
-                {ip} {ip === "10.110.120.201" ? "(Wi-Fi)" : "(Hotspot)"}
+                {ip} {ip.startsWith("192.168.137") ? "(Hotspot)" : "(Wi-Fi)"}
               </button>
             ))}
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              type="text"
+              placeholder="Enter Custom IP (e.g. 192.168.1.100)"
+              className="flex-1 rounded-lg border border-gray-800 bg-gray-900 px-3 py-1.5 text-xs text-white font-mono outline-none focus:border-green-500"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const customIp = (e.target as HTMLInputElement).value.trim();
+                  if (customIp) handleIpChange(customIp);
+                }
+              }}
+            />
+            <span className="text-[10px] text-gray-500">Press Enter to apply</span>
           </div>
         </div>
 

@@ -41,3 +41,5 @@ class SessionResponse(BaseModel):
     created_at: str
     ended_at: Optional[str] = None
     participant_count: int = 0
+    current_speaker: Optional[str] = None
+    speaker_queue: list[str] = []

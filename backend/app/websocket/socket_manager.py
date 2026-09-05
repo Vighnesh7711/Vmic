@@ -9,6 +9,8 @@ sio = socketio.AsyncServer(
 )
 
 socket_metadata = {}
+pending_offers = {}
+pending_ice_candidates = {}
 
 
 @sio.event
@@ -64,6 +66,19 @@ async def disconnect(
     ):
 
         return
+
+    session = get_session(room_code)
+    floor = session.get("floor") if session else None
+    if floor and floor.get("current_speaker") == participant_id:
+        floor["current_speaker"] = floor["queue"].pop(0) if floor["queue"] else None
+        await sio.emit(
+            "floor_updated",
+            {
+                "current_speaker": floor["current_speaker"],
+                "queue": floor["queue"],
+            },
+            room=room_code,
+        )
 
     await sio.emit(
         "participant_left",
@@ -137,6 +152,25 @@ async def join_room(
             participant_id,
     }
 
+    if role == "participant":
+        floor = session.setdefault(
+            "floor",
+            {
+                "current_speaker": None,
+                "queue": [],
+            },
+        )
+        if floor["current_speaker"] is None:
+            floor["current_speaker"] = participant_id
+            await sio.emit(
+                "floor_updated",
+                {
+                    "current_speaker": participant_id,
+                    "queue": floor["queue"],
+                },
+                room=room_code,
+            )
+
     print(
         f"[Socket.IO] {sid} joined {room_code} as {role}"
     )
@@ -154,6 +188,26 @@ async def join_room(
         },
         to=sid
     )
+
+    floor = session.get(
+        "floor",
+        {
+            "current_speaker": None,
+            "queue": [],
+        },
+    )
+    await sio.emit(
+        "floor_updated",
+        {
+            "current_speaker": floor.get("current_speaker"),
+            "queue": floor.get("queue", []),
+        },
+        to=sid,
+    )
+
+    if role == "host":
+        for offer in pending_offers.get(room_code, []):
+            await sio.emit("webrtc_offer", offer, to=sid)
 
     if role == "participant":
 
@@ -245,6 +299,17 @@ async def request_floor(
             participant_id
         )
 
+    participant = next(
+        (
+            item
+            for item in session.get("participants", [])
+            if item.get("participant_id") == participant_id
+        ),
+        None,
+    )
+    if participant:
+        participant["muted"] = floor.get("current_speaker") != participant_id
+
     await sio.emit(
         "floor_updated",
         {
@@ -275,7 +340,7 @@ async def grant_floor(
     if not metadata:
         return
 
-    if metadata.get("role") != "host":
+    if metadata.get("role") != "host" and metadata.get("participant_id") != data.get("participant_id"):
         return
 
     room_code = metadata.get(
@@ -353,6 +418,10 @@ async def release_floor(
         "room_code"
     )
 
+    participant_id = metadata.get(
+        "participant_id"
+    )
+
     if not room_code:
         return
 
@@ -368,6 +437,12 @@ async def release_floor(
     )
 
     if not floor:
+        return
+
+    if (
+        metadata.get("role") == "participant"
+        and floor.get("current_speaker") != participant_id
+    ):
         return
 
     floor[
@@ -519,7 +594,7 @@ async def mute_participant(
     if not metadata:
         return
 
-    if metadata.get("role") != "host":
+    if metadata.get("role") != "host" and metadata.get("participant_id") != data.get("participant_id"):
         return
 
     room_code = metadata.get(
@@ -537,22 +612,9 @@ async def mute_participant(
     if not session:
         return
 
-    for participant in session.get(
-        "participants",
-        []
-    ):
-
-        if (
-            participant[
-                "participant_id"
-            ]
-            == participant_id
-        ):
-
-            participant[
-                "muted"
-            ] = True
-
+    for participant in session.get("participants", []):
+        if participant["participant_id"] == participant_id:
+            participant["muted"] = True
             break
 
     await sio.emit(
@@ -581,7 +643,7 @@ async def unmute_participant(
     if not metadata:
         return
 
-    if metadata.get("role") != "host":
+    if metadata.get("role") != "host" and metadata.get("participant_id") != data.get("participant_id"):
         return
 
     room_code = metadata.get(
@@ -599,35 +661,19 @@ async def unmute_participant(
     if not session:
         return
 
-    for participant in session.get(
-        "participants",
-        []
-    ):
+    participants = session.get("participants", [])
+    for participant in participants:
+        participant["muted"] = participant["participant_id"] != participant_id
 
-        if (
-            participant[
-                "participant_id"
-            ]
-            == participant_id
-        ):
-
-            participant[
-                "muted"
-            ] = False
-
-            break
-
-    await sio.emit(
-        "audio_control_updated",
-        {
-            "participant_id":
-                participant_id,
-
-            "muted":
-                False
-        },
-        room=room_code
-    )
+    for participant in participants:
+        await sio.emit(
+            "audio_control_updated",
+            {
+                "participant_id": participant["participant_id"],
+                "muted": participant["participant_id"] != participant_id,
+            },
+            room=room_code,
+        )
 
 
 @sio.event
@@ -741,6 +787,15 @@ async def webrtc_offer(
         f"[WebRTC] Offer from {participant_id}"
     )
 
+    offers = pending_offers.setdefault(room_code, [])
+    offers[:] = [offer for offer in offers if offer["participant_id"] != participant_id]
+    offers.append(
+        {
+            "participant_id": participant_id,
+            "sdp": sdp,
+        }
+    )
+
     await sio.emit(
         "webrtc_offer",
         {
@@ -750,6 +805,7 @@ async def webrtc_offer(
         room=room_code,
         skip_sid=sid
     )
+
 
 
 @sio.event
@@ -786,6 +842,19 @@ async def webrtc_answer(
         skip_sid=sid
     )
 
+    for candidate in pending_ice_candidates.pop(room_code, []):
+        await sio.emit("ice_candidate", candidate, to=sid)
+
+    remaining_offers = [
+        offer
+        for offer in pending_offers.get(room_code, [])
+        if offer["participant_id"] != participant_id
+    ]
+    if remaining_offers:
+        pending_offers[room_code] = remaining_offers
+    else:
+        pending_offers.pop(room_code, None)
+
 
 @sio.event
 async def ice_candidate(
@@ -807,6 +876,23 @@ async def ice_candidate(
     if session is None:
         return
 
+    has_pending_offer = any(
+        offer["participant_id"] == participant_id
+        for offer in pending_offers.get(room_code, [])
+    )
+    has_host = any(
+        metadata.get("role") == "host"
+        and metadata.get("room_code") == room_code
+        for metadata in socket_metadata.values()
+    )
+    if not has_host or has_pending_offer:
+        pending_ice_candidates.setdefault(room_code, []).append(
+            {
+                "participant_id": participant_id,
+                "candidate": candidate,
+            }
+        )
+
     print(
         f"[WebRTC] ICE candidate from {participant_id}"
     )
@@ -820,6 +906,7 @@ async def ice_candidate(
         room=room_code,
         skip_sid=sid
     )
+
 
 
 async def broadcast_participant_joined(

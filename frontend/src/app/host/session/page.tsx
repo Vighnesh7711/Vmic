@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 
 import { getSocket } from "@/services/socket";
@@ -12,8 +12,9 @@ import { VMICTransportManager } from "@/services/transport-manager";
 import { WiFiWebRTCTransport } from "@/services/transports/wifi-webrtc-transport";
 import { BluetoothTransport, BluetoothAudioDevice } from "@/services/transports/bluetooth-transport";
 import { ParticipantCard } from "@/components/participant/participant-card";
+import { WaveformVisualizer } from "@/components/audio/waveform-visualizer";
 import { SOCKET_EVENTS } from "@/lib/socket-events";
-import { getFrontendUrl } from "@/lib/config";
+import { getBackendUrl, getFrontendUrl } from "@/lib/config";
 
 export default function HostSessionPage() {
 
@@ -36,8 +37,11 @@ export default function HostSessionPage() {
   const [selectedOutputDevice, setSelectedOutputDevice] = useState<string>("");
 
   const [currentSpeaker, setCurrentSpeaker] = useState<string | null>(null);
+  const currentSpeakerRef = useRef<string | null>(null);
+  const joinedRoomRef = useRef<string | null>(null);
+  const handledOffersRef = useRef(new Set<string>());
   const [speakerQueue, setSpeakerQueue] = useState<string[]>([]);
-  const [speakingMode, setSpeakingMode] = useState<SpeakingMode>("open");
+  const speakingMode: SpeakingMode = "controlled";
   const [roomCode, setRoomCode] = useState<string>("");
   const [joinUrl, setJoinUrl] = useState<string>("");
 
@@ -91,6 +95,12 @@ export default function HostSessionPage() {
           (participantId, stream) => {
             audioEngine
               .addParticipantStream(participantId, stream)
+              .then(() => {
+                audioEngine.setParticipantFloor(
+                  participantId,
+                  currentSpeakerRef.current === participantId
+                );
+              })
               .catch((error) => {
                 console.error("[Audio] Failed to add stream:", error);
               });
@@ -150,16 +160,51 @@ export default function HostSessionPage() {
     setJoinUrl(`${getFrontendUrl()}/join?room=${code}`);
 
     if (code) {
-      socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
-        room_code: code,
-        role: "host",
-      });
+      fetch(`${getBackendUrl()}/api/sessions/${code}`)
+        .then((response) => response.json())
+        .then((session) => {
+          const speaker = session.current_speaker ?? null;
+          currentSpeakerRef.current = speaker;
+          setCurrentSpeaker(speaker);
+          setSpeakerQueue(session.speaker_queue ?? []);
+          if (speaker) {
+            audioEngine.setParticipantFloor(speaker, true);
+          }
+        })
+        .catch((error) => console.error("[Host] Failed to load floor state:", error));
+
+      fetch(`${getBackendUrl()}/api/sessions/${code}/participants`)
+        .then((response) => response.json())
+        .then((existingParticipants) => {
+          if (!Array.isArray(existingParticipants)) return;
+
+          setParticipants(existingParticipants.map((participant) => {
+            const transport = (participant.transport?.toLowerCase() || "wifi") as AudioTransportType;
+            return {
+            participantId: participant.participant_id,
+            displayName: participant.display_name,
+            connectionType: transport,
+            transport,
+            connectionState: participant.connection_state || "connecting",
+            volume: Math.round((participant.volume ?? 1) * 100),
+            muted: participant.muted ?? false,
+            audioLevel: 0,
+            speaking: false,
+            floorState: "none",
+            pushToTalkActive: true,
+            };
+          }));
+        })
+        .catch((error) => console.error("[Host] Failed to load participants:", error));
     }
 
     // Auto-discover connected Bluetooth Speakers / Output Sinks
     handleScanOutputDevices();
 
     const handleOffer = async (data: { participant_id: string; sdp: string }) => {
+      if (handledOffersRef.current.has(data.participant_id)) return;
+      handledOffersRef.current.add(data.participant_id);
+
       try {
         const answer = await hostWebRTC.handleOffer(data.participant_id, data.sdp);
         socket.emit(SOCKET_EVENTS.WEBRTC_ANSWER, {
@@ -171,6 +216,7 @@ export default function HostSessionPage() {
         wifiTransport.connect(data.participant_id);
         setStatus(`Answer sent to ${data.participant_id}`);
       } catch (error) {
+        handledOffersRef.current.delete(data.participant_id);
         console.error("[Host WebRTC] Error:", error);
         setStatus("WebRTC negotiation failed");
       }
@@ -182,6 +228,14 @@ export default function HostSessionPage() {
 
     socket.on(SOCKET_EVENTS.WEBRTC_OFFER, handleOffer);
     socket.on(SOCKET_EVENTS.ICE_CANDIDATE, handleIceCandidate);
+
+    if (code && joinedRoomRef.current !== code) {
+      joinedRoomRef.current = code;
+      socket.emit(SOCKET_EVENTS.JOIN_ROOM, {
+        room_code: code,
+        role: "host",
+      });
+    }
 
     return () => {
       socket.off(SOCKET_EVENTS.WEBRTC_OFFER, handleOffer);
@@ -223,7 +277,7 @@ export default function HostSessionPage() {
             audioLevel: 0,
             speaking: false,
             floorState: "none",
-            pushToTalkActive: false,
+            pushToTalkActive: true,
           },
         ];
       });
@@ -277,6 +331,7 @@ export default function HostSessionPage() {
       queue: string[];
     }) => {
       setCurrentSpeaker(data.current_speaker);
+      currentSpeakerRef.current = data.current_speaker;
       setSpeakerQueue(data.queue);
 
       setParticipants((current) =>
@@ -325,6 +380,36 @@ export default function HostSessionPage() {
     };
   }, [socket, audioEngine]);
 
+  useEffect(() => {
+    const handleAudioControl = (data: { participant_id: string; muted: boolean }) => {
+      if (data.muted) {
+        audioEngine.muteParticipant(data.participant_id);
+      } else {
+        const participant = participants.find(
+          (item) => item.participantId === data.participant_id
+        );
+        audioEngine.unmuteParticipant(
+          data.participant_id,
+          participant ? participant.volume / 100 : 1
+        );
+      }
+
+      setParticipants((current) =>
+        current.map((participant) =>
+          participant.participantId === data.participant_id
+            ? { ...participant, muted: data.muted }
+            : participant
+        )
+      );
+    };
+
+    socket.on(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
+
+    return () => {
+      socket.off(SOCKET_EVENTS.AUDIO_CONTROL_UPDATED, handleAudioControl);
+    };
+  }, [socket, audioEngine, participants]);
+
   const handleScanBluetoothDevices = async () => {
     try {
       const devices = await bluetoothTransport.enumerateBluetoothDevices();
@@ -366,6 +451,11 @@ export default function HostSessionPage() {
   };
 
   const handleMute = (participantId: string) => {
+    const participant = participants.find((p) => p.participantId === participantId);
+    if (!participant) {
+      return;
+    }
+
     setParticipants((current) =>
       current.map((p) => {
         if (p.participantId === participantId) {
@@ -406,12 +496,6 @@ export default function HostSessionPage() {
 
   const handleReleaseFloor = (participantId: string) => {
     socket.emit(SOCKET_EVENTS.RELEASE_FLOOR, { participant_id: participantId });
-  };
-
-  const toggleSpeakingMode = () => {
-    const nextMode = speakingMode === "controlled" ? "open" : "controlled";
-    setSpeakingMode(nextMode);
-    audioEngine.setSpeakingMode(nextMode);
   };
 
   const handleScanOutputDevices = async () => {
@@ -462,19 +546,9 @@ export default function HostSessionPage() {
           {status}
         </p>
 
-        <div className="mt-4 flex items-center justify-center gap-4">
-          <span className="text-sm text-gray-400">Speaking Mode:</span>
-          <button
-            onClick={toggleSpeakingMode}
-            className={`rounded-lg px-3 py-1.5 text-xs font-bold uppercase transition ${
-              speakingMode === "open"
-                ? "bg-green-500 text-black"
-                : "bg-blue-500 text-white"
-            }`}
-          >
-            {speakingMode} Floor Mode
-          </button>
-        </div>
+        <p className="mt-4 text-sm text-blue-400">
+          Single-speaker mode: only the participant with the floor can speak.
+        </p>
 
         <p className="mt-2 text-sm text-gray-500">
           Connected Participants: {participants.length}
@@ -621,6 +695,138 @@ export default function HostSessionPage() {
           }}
           className="mt-4 w-full accent-green-500"
         />
+      </div>
+
+      {/* DSP Processing Controls */}
+      <div className="mt-6 w-full max-w-xl rounded-xl border border-gray-800 bg-gray-900 p-5 space-y-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className="font-semibold text-md text-yellow-400">
+            🎛️ Audio DSP Pipeline
+          </span>
+          <span className="text-[10px] text-gray-500 font-mono">
+            Latency: {(audioEngine.getLatencyMs?.() ?? 0).toFixed(1)}ms
+          </span>
+        </div>
+
+        {/* Live Host Waveform Canvas */}
+        <WaveformVisualizer analyser={audioEngine.getMixerAnalyser?.() ?? null} height={110} />
+
+        <div className="space-y-3 text-xs">
+          {/* Adaptive Feedback Reduction */}
+          <div className="rounded-lg border border-yellow-900/60 bg-yellow-950/20 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <label className="text-yellow-300 font-semibold">Adaptive Feedback Reduction</label>
+                <p className="mt-1 text-[10px] text-gray-500">
+                  Tracks whistling feedback peaks and suppresses them with narrow filters.
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                defaultChecked
+                onChange={(event) => {
+                  audioEngine.updateConfig({ feedbackReductionEnabled: event.target.checked });
+                }}
+                className="h-4 w-4 accent-yellow-500"
+                aria-label="Enable adaptive feedback reduction"
+              />
+            </div>
+            <div className="mt-3">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-gray-400 font-semibold">Detection Sensitivity</label>
+                <span className="text-green-400 font-mono font-bold" id="feedback-sensitivity-val">185</span>
+              </div>
+              <input
+                type="range"
+                min="150"
+                max="230"
+                defaultValue="185"
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  audioEngine.updateConfig({ feedbackDetectionThreshold: value });
+                  const label = document.getElementById("feedback-sensitivity-val");
+                  if (label) label.textContent = String(value);
+                }}
+                className="w-full accent-yellow-500"
+              />
+              <p className="text-[10px] text-gray-600 mt-1">
+                Lower values react sooner; raise it if normal speech is being affected.
+              </p>
+            </div>
+          </div>
+
+          {/* High-Pass Filter */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-gray-400 font-semibold">High-Pass Filter (Hz)</label>
+              <span className="text-green-400 font-mono font-bold" id="hp-freq-val">120</span>
+            </div>
+            <input
+              type="range"
+              min="20"
+              max="300"
+              defaultValue="120"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                audioEngine.updateConfig?.({ highPassCutoff: val });
+                const el = document.getElementById("hp-freq-val");
+                if (el) el.textContent = String(val);
+              }}
+              className="w-full accent-yellow-500"
+            />
+            <p className="text-[10px] text-gray-600 mt-1">
+              Removes low-frequency rumble, hum, and handling noise below cutoff
+            </p>
+          </div>
+
+          {/* Compressor Threshold */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-gray-400 font-semibold">Compressor Threshold (dB)</label>
+              <span className="text-green-400 font-mono font-bold" id="comp-thresh-val">-24</span>
+            </div>
+            <input
+              type="range"
+              min="-60"
+              max="0"
+              defaultValue="-24"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                audioEngine.updateConfig?.({ compressorThreshold: val });
+                const el = document.getElementById("comp-thresh-val");
+                if (el) el.textContent = String(val);
+              }}
+              className="w-full accent-yellow-500"
+            />
+            <p className="text-[10px] text-gray-600 mt-1">
+              Audio above this level gets compressed for consistent volume
+            </p>
+          </div>
+
+          {/* Compressor Ratio */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-gray-400 font-semibold">Compressor Ratio</label>
+              <span className="text-green-400 font-mono font-bold" id="comp-ratio-val">4:1</span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="20"
+              defaultValue="4"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                audioEngine.updateConfig?.({ compressorRatio: val });
+                const el = document.getElementById("comp-ratio-val");
+                if (el) el.textContent = `${val}:1`;
+              }}
+              className="w-full accent-yellow-500"
+            />
+            <p className="text-[10px] text-gray-600 mt-1">
+              Higher ratio = more compression. 4:1 is good for voice
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* Participant Cards List */}
