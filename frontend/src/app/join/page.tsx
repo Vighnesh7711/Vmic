@@ -3,10 +3,11 @@
 import { useEffect, useState, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { VMICWebRTC } from "@/services/webrtc";
+import { VMICWebRTC, AudioProcessingConfig } from "@/services/webrtc";
 import { getSocket } from "@/services/socket";
 import { SOCKET_EVENTS } from "@/lib/socket-events";
 import { getBackendUrl } from "@/lib/config";
+import { WaveformVisualizer } from "@/components/audio/waveform-visualizer";
 import {
   VMICTransportSelector,
   TransportPreference,
@@ -37,6 +38,19 @@ function JoinForm() {
 
   const [currentSpeaker, setCurrentSpeaker] = useState<string | null>(null);
 
+  // Audio processing toggles
+  const [audioProcessing, setAudioProcessing] = useState<AudioProcessingConfig>({
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    gateThreshold: 0.06,
+    gateHoldMs: 250,
+  });
+
+  // Live mic level from noise gate
+  const [micLevel, setMicLevel] = useState(0);
+  const [gateIsOpen, setGateIsOpen] = useState(false);
+
   const [socket] = useState(
     () => getSocket()
   );
@@ -57,9 +71,21 @@ function JoinForm() {
             participant_id: participant.participant_id,
             candidate: candidate.toJSON(),
           });
+        },
+        undefined,
+        // Mic level callback for live UI meter
+        (level: number, open: boolean) => {
+          setMicLevel(level);
+          setGateIsOpen(open);
         }
       )
   );
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.location.protocol === "http:") {
+      window.location.href = window.location.href.replace("http:", "https:");
+    }
+  }, []);
 
   useEffect(() => {
     if (roomParam && !roomCode) {
@@ -353,6 +379,105 @@ function JoinForm() {
           >
             ⏱️ TEST E2E LATENCY PING
           </button>
+        )}
+
+        {/* Audio Processing Controls */}
+        {participantId && (
+          <div className="rounded-xl border border-gray-800 bg-gray-950 p-4 space-y-4">
+            <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider">🎛️ Audio Processing</p>
+
+            {/* Live Waveform & Echo Detector Canvas */}
+            <WaveformVisualizer analyser={webrtc.getAnalyserNode?.() ?? null} height={100} />
+
+            {/* Live Mic Level Meter + Gate Status */}
+            <div className="rounded-lg bg-gray-900 border border-gray-800 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] text-gray-500 font-semibold">MIC LEVEL</span>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                  gateIsOpen
+                    ? "bg-green-500/20 text-green-400 border border-green-500/40"
+                    : "bg-red-500/20 text-red-400 border border-red-500/40"
+                }`}>
+                  GATE {gateIsOpen ? "OPEN" : "CLOSED"}
+                </span>
+              </div>
+              <div className="w-full h-3 bg-gray-800 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-75 ${
+                    gateIsOpen ? "bg-green-500" : "bg-red-500/60"
+                  }`}
+                  style={{ width: `${Math.min(100, micLevel * 500)}%` }}
+                />
+              </div>
+              <div className="flex justify-between mt-1">
+                <span className="text-[9px] text-gray-600">0</span>
+                <span className="text-[9px] text-gray-600 font-mono">
+                  {(micLevel * 100).toFixed(1)}%
+                </span>
+                <span className="text-[9px] text-gray-600">100</span>
+              </div>
+            </div>
+
+            {/* Gate Threshold Slider */}
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-[11px] text-gray-400 font-semibold">🚪 Gate Sensitivity</label>
+                <span className="text-[10px] text-green-400 font-mono font-bold">
+                  {(audioProcessing.gateThreshold * 100).toFixed(0)}%
+                </span>
+              </div>
+              <input
+                type="range"
+                min="1"
+                max="20"
+                value={audioProcessing.gateThreshold * 100}
+                onChange={(e) => {
+                  const val = Number(e.target.value) / 100;
+                  const updated = { ...audioProcessing, gateThreshold: val };
+                  setAudioProcessing(updated);
+                  webrtc.setAudioProcessing({ gateThreshold: val });
+                }}
+                className="w-full accent-green-500"
+              />
+              <div className="flex justify-between">
+                <span className="text-[9px] text-gray-600">Sensitive</span>
+                <span className="text-[9px] text-gray-600">Aggressive</span>
+              </div>
+              <p className="text-[9px] text-gray-600 mt-1">
+                Higher = only loud/close speech passes. Prevents feedback loops.
+              </p>
+            </div>
+
+            {/* Toggle Buttons */}
+            <div className="space-y-2">
+              {[
+                { key: "echoCancellation" as const, label: "Echo Cancellation", icon: "🔇" },
+                { key: "noiseSuppression" as const, label: "Noise Suppression", icon: "🔈" },
+                { key: "autoGainControl" as const, label: "Auto Gain Control", icon: "📊" },
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  onClick={() => {
+                    const updated = { ...audioProcessing, [opt.key]: !audioProcessing[opt.key] };
+                    setAudioProcessing(updated);
+                    webrtc.setAudioProcessing(updated);
+                  }}
+                  className={`w-full flex items-center justify-between rounded-lg px-3 py-2.5 text-xs font-semibold transition border ${
+                    audioProcessing[opt.key]
+                      ? "bg-green-500/15 text-green-400 border-green-500/40"
+                      : "bg-gray-900 text-gray-500 border-gray-800"
+                  }`}
+                >
+                  <span>{opt.icon} {opt.label}</span>
+                  <span className={`text-[10px] font-bold uppercase ${
+                    audioProcessing[opt.key] ? "text-green-400" : "text-gray-600"
+                  }`}>
+                    {audioProcessing[opt.key] ? "ON" : "OFF"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
         )}
       </div>
 

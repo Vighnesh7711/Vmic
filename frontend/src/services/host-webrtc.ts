@@ -119,10 +119,12 @@ export class VMICHostWebRTC {
 
     const peerConnection =
       new RTCPeerConnection({
+        // Single STUN server as fallback; LAN candidates will be preferred
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
         ],
+        // Pre-allocate ICE candidate for faster gathering on LAN
+        iceCandidatePoolSize: 1,
       });
 
     this.peerConnections.set(

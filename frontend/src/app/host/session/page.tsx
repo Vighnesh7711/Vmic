@@ -12,6 +12,7 @@ import { VMICTransportManager } from "@/services/transport-manager";
 import { WiFiWebRTCTransport } from "@/services/transports/wifi-webrtc-transport";
 import { BluetoothTransport, BluetoothAudioDevice } from "@/services/transports/bluetooth-transport";
 import { ParticipantCard } from "@/components/participant/participant-card";
+import { WaveformVisualizer } from "@/components/audio/waveform-visualizer";
 import { SOCKET_EVENTS } from "@/lib/socket-events";
 import { getBackendUrl, getFrontendUrl } from "@/lib/config";
 
@@ -694,6 +695,138 @@ export default function HostSessionPage() {
           }}
           className="mt-4 w-full accent-green-500"
         />
+      </div>
+
+      {/* DSP Processing Controls */}
+      <div className="mt-6 w-full max-w-xl rounded-xl border border-gray-800 bg-gray-900 p-5 space-y-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className="font-semibold text-md text-yellow-400">
+            🎛️ Audio DSP Pipeline
+          </span>
+          <span className="text-[10px] text-gray-500 font-mono">
+            Latency: {(audioEngine.getLatencyMs?.() ?? 0).toFixed(1)}ms
+          </span>
+        </div>
+
+        {/* Live Host Waveform Canvas */}
+        <WaveformVisualizer analyser={audioEngine.getMixerAnalyser?.() ?? null} height={110} />
+
+        <div className="space-y-3 text-xs">
+          {/* Adaptive Feedback Reduction */}
+          <div className="rounded-lg border border-yellow-900/60 bg-yellow-950/20 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <label className="text-yellow-300 font-semibold">Adaptive Feedback Reduction</label>
+                <p className="mt-1 text-[10px] text-gray-500">
+                  Tracks whistling feedback peaks and suppresses them with narrow filters.
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                defaultChecked
+                onChange={(event) => {
+                  audioEngine.updateConfig({ feedbackReductionEnabled: event.target.checked });
+                }}
+                className="h-4 w-4 accent-yellow-500"
+                aria-label="Enable adaptive feedback reduction"
+              />
+            </div>
+            <div className="mt-3">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-gray-400 font-semibold">Detection Sensitivity</label>
+                <span className="text-green-400 font-mono font-bold" id="feedback-sensitivity-val">185</span>
+              </div>
+              <input
+                type="range"
+                min="150"
+                max="230"
+                defaultValue="185"
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  audioEngine.updateConfig({ feedbackDetectionThreshold: value });
+                  const label = document.getElementById("feedback-sensitivity-val");
+                  if (label) label.textContent = String(value);
+                }}
+                className="w-full accent-yellow-500"
+              />
+              <p className="text-[10px] text-gray-600 mt-1">
+                Lower values react sooner; raise it if normal speech is being affected.
+              </p>
+            </div>
+          </div>
+
+          {/* High-Pass Filter */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-gray-400 font-semibold">High-Pass Filter (Hz)</label>
+              <span className="text-green-400 font-mono font-bold" id="hp-freq-val">120</span>
+            </div>
+            <input
+              type="range"
+              min="20"
+              max="300"
+              defaultValue="120"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                audioEngine.updateConfig?.({ highPassCutoff: val });
+                const el = document.getElementById("hp-freq-val");
+                if (el) el.textContent = String(val);
+              }}
+              className="w-full accent-yellow-500"
+            />
+            <p className="text-[10px] text-gray-600 mt-1">
+              Removes low-frequency rumble, hum, and handling noise below cutoff
+            </p>
+          </div>
+
+          {/* Compressor Threshold */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-gray-400 font-semibold">Compressor Threshold (dB)</label>
+              <span className="text-green-400 font-mono font-bold" id="comp-thresh-val">-24</span>
+            </div>
+            <input
+              type="range"
+              min="-60"
+              max="0"
+              defaultValue="-24"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                audioEngine.updateConfig?.({ compressorThreshold: val });
+                const el = document.getElementById("comp-thresh-val");
+                if (el) el.textContent = String(val);
+              }}
+              className="w-full accent-yellow-500"
+            />
+            <p className="text-[10px] text-gray-600 mt-1">
+              Audio above this level gets compressed for consistent volume
+            </p>
+          </div>
+
+          {/* Compressor Ratio */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-gray-400 font-semibold">Compressor Ratio</label>
+              <span className="text-green-400 font-mono font-bold" id="comp-ratio-val">4:1</span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="20"
+              defaultValue="4"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                audioEngine.updateConfig?.({ compressorRatio: val });
+                const el = document.getElementById("comp-ratio-val");
+                if (el) el.textContent = `${val}:1`;
+              }}
+              className="w-full accent-yellow-500"
+            />
+            <p className="text-[10px] text-gray-600 mt-1">
+              Higher ratio = more compression. 4:1 is good for voice
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* Participant Cards List */}
